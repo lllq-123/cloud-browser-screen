@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <title>虚拟屏幕</title>
+  <!-- 空图标：不然浏览器会自己去要 /favicon.ico，在别人的站点下面白白 404 一次 -->
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <div id="app" class="app">
+
+    <!-- 进门：输入口令 -->
+    <section id="view-login" class="view view-login" hidden>
+      <div class="login">
+        <h1 class="login-title">虚拟屏幕</h1>
+        <p class="login-sub">输入小机给你的口令</p>
+        <form id="login-form" class="login-form" novalidate>
+          <input id="login-token" class="field" type="password" placeholder="口令" aria-label="口令"
+            autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="go">
+          <button id="login-go" class="btn-primary" type="submit" disabled>进去</button>
+        </form>
+        <p id="login-msg" class="login-msg" role="alert"></p>
+      </div>
+    </section>
+
+    <!-- 列表：每个开着的网页一张卡 -->
+    <section id="view-list" class="view view-list" hidden>
+      <header class="list-head">
+        <div class="list-heading">
+          <h1 class="list-title">虚拟屏幕</h1>
+          <p id="list-count" class="list-count"></p>
+        </div>
+        <button id="logout" class="link-btn" type="button">退出</button>
+      </header>
+      <div class="list-scroll">
+        <p id="list-toast" class="toast" role="status" hidden></p>
+        <p id="list-status" class="list-status" role="status" hidden></p>
+        <div id="list-empty" class="empty" hidden>
+          <p class="empty-main">现在没有开着的网页</p>
+          <p class="empty-sub">小机打开网页以后，这里会自动出现</p>
+        </div>
+        <ul id="cards" class="cards"></ul>
+      </div>
+    </section>
+
+    <!-- 看画面。这一节是尺寸监听盯着的根节点，横过来看时只转里面那层，它自己不动 -->
+    <section id="view-live" class="view live" hidden>
+      <div id="live-layer" class="live-layer">
+        <header class="live-top">
+          <button id="live-back" class="back-btn" type="button">返回</button>
+          <p class="live-name"><span id="live-site" class="live-site"></span><span id="live-title" class="live-title"></span></p>
+          <span id="live-state" class="chip" data-state="connecting">连接中</span>
+        </header>
+
+        <div class="live-body">
+          <!-- 横着看时才出现的两条边栏 -->
+          <div class="side side-start">
+            <button id="side-back" class="side-btn" type="button">返回</button>
+            <button id="side-upright" class="side-btn" type="button" hidden>竖回来</button>
+          </div>
+
+          <div id="stage" class="stage">
+            <div id="frame" class="frame">
+              <div id="frame-clip" class="frame-clip">
+                <div id="frame-screen" class="frame-screen">
+                  <canvas id="screen" class="screen" width="1" height="1"
+                    aria-label="网页实时画面：点一下是点网页，上下滑滚动，两指捏放大"></canvas>
+                </div>
+              </div>
+              <div id="frame-wait" class="frame-wait">
+                <p id="frame-wait-text" class="frame-wait-text">正在连接…</p>
+                <button id="frame-wait-btn" class="pill-btn" type="button" hidden>重新连接</button>
+              </div>
+              <button id="zoom-reset" class="zoom-badge" type="button" aria-label="恢复原大小" hidden>1.0×</button>
+            </div>
+            <p id="live-note" class="live-note" role="status" hidden></p>
+          </div>
+
+          <div class="side side-end">
+            <button id="side-type" class="side-btn" type="button">打字</button>
+            <span id="side-state" class="chip chip-small" data-state="connecting">连接中</span>
+          </div>
+        </div>
+
+        <div class="live-tools">
+          <p class="hint">点一下就是点网页 · 两指捏放大</p>
+          <button id="rotate-btn" class="pill-btn" type="button">横过来看</button>
+        </div>
+
+        <form id="type-form" class="typebar" novalidate>
+          <div class="type-row">
+            <input id="type-input" class="field type-input" type="text" maxlength="2000"
+              placeholder="先点网页里的框，再在这里打字" aria-label="打到网页里的字"
+              autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="send">
+            <button id="type-send" class="btn-primary send-btn" type="submit" disabled>发送</button>
+          </div>
+          <div class="type-row type-keys">
+            <button class="key-btn" type="button" data-key="Enter" disabled>回车</button>
+            <button class="key-btn" type="button" data-key="Backspace" disabled>删除</button>
+            <button class="key-btn" type="button" data-key="Tab" disabled>Tab</button>
+            <button id="type-pw" class="pw-toggle" type="button" aria-pressed="false">密码<span class="switch" aria-hidden="true"></span></button>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <noscript><p class="noscript">这个页面要打开 JavaScript 才能用。</p></noscript>
+  </div>
+</body>
+</html>

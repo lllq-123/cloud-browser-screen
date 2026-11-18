@@ -1,0 +1,5 @@
+# The versions we run at home (Python 3.12). Newer ones may work; these are the tested ones.
+starlette==1.0.0
+uvicorn==0.44.0
+httpx==0.28.1
+websockets==16.0

@@ -1,0 +1,16 @@
+[Unit]
+Description=Virtual screen: watch and control the cloud browser from a phone
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/cloud-browser-screen/server
+# 口令和设置放在这个文件里（权限 600，只有自己能读），见 examples/vscreen.env.example
+EnvironmentFile=%h/.config/vscreen/vscreen.env
+ExecStart=%h/cloud-browser-screen/.venv/bin/python app.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
