@@ -7,8 +7,8 @@
 // · 从看画面回列表就断开看屏连接（关 WebSocket + DELETE），不然服务器会一直把那个网页拉在最前面。
 
 import {
-  DETAIL_SCALE, GestureTracker, MAX_RETRIES, ScrollAccumulator, authMessage, captionOf, clampPan, cleanToken,
-  containFit, countLabel, detailMessage, displayedSize, framePoint, friendlyError, friendlyWarn, isZoomed,
+  DETAIL_SCALE, GestureTracker, LONG_PRESS_MS, MAX_RETRIES, ScrollAccumulator, authMessage, captionOf, clampPan, cleanToken,
+  containFit, countLabel, detailMessage, displayedSize, dragMessage, framePoint, friendlyError, friendlyWarn, isZoomed,
   keyMessage, landscapeMode, panView, parseServerText, parseWindows, pickFrame, pinchStart, pinchView, pingMessage,
   retryDelay, scrollMessage, selectMessage, snapView, tapMessage, textMessage, tokenFromHash, viewPoint,
   viewerSocketUrl,
@@ -81,6 +81,8 @@ const SILENCE_LIMIT_MS = 30000;
 const MAX_BUFFERED_BYTES = 64 * 1024;
 /** 跟手滚的消息最多每 40ms 发一次 */
 const SCROLL_FLUSH_MS = 40;
+/** 连续拖动只保留最新落点；起点、松手和取消立即发送。 */
+const DRAG_FLUSH_MS = 40;
 const CLOSED_NOTICE_MS = 1300;
 const LIST_TOAST_MS = 4000;
 const NOTE_MS = 3000;
@@ -537,6 +539,10 @@ class Viewer {
     this.pending = null;
     this.decoding = false;
     this.image = null;
+    this.imageGeneration = -1;
+    this.dragState = null;
+    this.dragPending = null;
+    this.dragTimer = null;
     this.reported = null;
     this.detailOn = false;
     /** 选中网页的第一帧画上去了才算接上；这之前不发点按 */
@@ -564,6 +570,49 @@ class Viewer {
     return this.live && dy !== 0 && this.send(scrollMessage(pt, 0, dy));
   }
 
+  drag(phase, pt) {
+    if (phase === 'start') {
+      this.cancelDrag();
+      if (!this.live || this.switching || this.selectedId !== this.wanted || this.imageGeneration !== this.generation) return false;
+      this.dragState = { generation: this.imageGeneration, point: pt };
+      if (this.send(dragMessage(pt, 'start', this.imageGeneration))) return true;
+      this.clearDrag();
+      return false;
+    }
+    const state = this.dragState;
+    if (!state || !this.live || state.generation !== this.generation) return false;
+    state.point = pt;
+    if (phase === 'end') {
+      this.clearDrag();
+      return this.send(dragMessage(pt, 'end', state.generation));
+    }
+    this.dragPending = pt;
+    if (this.dragTimer === null) {
+      this.dragTimer = setTimeout(() => {
+        this.dragTimer = null;
+        const latest = this.dragPending;
+        this.dragPending = null;
+        if (latest && this.dragState === state && this.live && state.generation === this.generation) {
+          this.send(dragMessage(latest, 'move', state.generation));
+        }
+      }, DRAG_FLUSH_MS);
+    }
+    return true;
+  }
+
+  cancelDrag() {
+    const state = this.dragState;
+    this.clearDrag();
+    if (state) this.send(dragMessage(state.point, 'cancel', state.generation));
+  }
+
+  clearDrag() {
+    if (this.dragTimer !== null) clearTimeout(this.dragTimer);
+    this.dragTimer = null;
+    this.dragPending = null;
+    this.dragState = null;
+  }
+
   text(value) {
     const message = textMessage(value);
     return !!message && this.live && this.send(message);
@@ -580,6 +629,8 @@ class Viewer {
 
   fail(code) {
     if (this.closed || this.ended) return;
+    // 失败后不再向拥塞通道补发取消，由关闭连接让服务器松开鼠标。
+    this.clearDrag();
     this.ended = true;
     this.live = false;
     if (this.keepalive !== null) clearInterval(this.keepalive);
@@ -669,12 +720,14 @@ class Viewer {
         this.hooks.windows(message.windows);
         return;
       case 'selected':
+        this.cancelDrag();
         this.generation = message.generation;
         this.selectedId = message.id;
         this.live = false;
         return;
       case 'closed':
         if (message.id !== this.selectedId) return;
+        this.cancelDrag();
         this.generation = -1;
         this.selectedId = null;
         this.live = false;
@@ -697,6 +750,8 @@ class Viewer {
         return;
       case 'error':
         this.lastError = message.error;
+        this.cancelDrag();
+        this.live = false;
         return;
       case 'stopped':
         this.fail(this.lastError || 'stream_disconnected');
@@ -734,6 +789,7 @@ class Viewer {
         }
         if (this.image) this.image.release();
         this.image = decoded;
+        this.imageGeneration = generation;
         this.paint();
         if (!this.live && this.selectedId && (this.switching === null || this.switching === this.selectedId)) {
           this.live = true;
@@ -780,6 +836,9 @@ class Viewer {
 
   /** 收尾：关通道 + DELETE 场次（服务器借此把浏览器窗口还给原来在最前面的网页） */
   stop() {
+    if (this.cleanup) return this.cleanup;
+    this.cancelDrag();
+    // 取消发送失败时 failed 回调可能已经收尾，复用那一次 DELETE。
     if (this.cleanup) return this.cleanup;
     this.closed = true;
     this.live = false;
@@ -834,6 +893,7 @@ const waitBox = byId('frame-wait');
 const waitText = byId('frame-wait-text');
 const waitButton = byId('frame-wait-btn');
 const zoomButton = byId('zoom-reset');
+const liveHint = byId('live-hint');
 const liveNote = byId('live-note');
 const uprightButton = byId('side-upright');
 const typeForm = byId('type-form');
@@ -876,12 +936,12 @@ const live = {
   tracker: new GestureTracker(),
   acc: new ScrollAccumulator(),
   flushTimer: null,
+  holdTimer: null,
   /** 这一轮滚动落在帧图的哪一点（按下的位置） */
   scrollAnchor: null,
   /** 这一轮第一根手指按下的屏幕坐标：点一下 / 滚动都落在按下的地方 */
   downClient: null,
   pinch: null,
-  panBase: null,
   password: false,
 };
 
@@ -983,11 +1043,13 @@ function connect() {
     },
     frame(size) {
       if (disposed) return;
+      if (size.w !== live.frame.w || size.h !== live.frame.h) resetGesture();
       live.frame = size;
       layoutFrame();
     },
     selected() {
       if (disposed) return;
+      resetGesture();
       live.retries = 0;
       live.shown = true;
       setPhase('live');
@@ -1003,6 +1065,7 @@ function connect() {
     },
     failed(code) {
       if (disposed) return;
+      resetGesture();
       void viewer.stop();
       live.shown = false;
       const { message, retry } = friendlyError(code);
@@ -1026,6 +1089,7 @@ function connect() {
   live.dispose = () => {
     disposed = true;
     if (retryTimer !== null) clearTimeout(retryTimer);
+    resetGesture();
     void viewer.stop();
     if (live.viewer === viewer) live.viewer = null;
   };
@@ -1112,6 +1176,7 @@ waitButton.addEventListener('click', () => {
 });
 
 function showClosed() {
+  resetGesture();
   live.closing = true;
   live.shown = false;
   renderLiveState();
@@ -1147,6 +1212,7 @@ function updateLiveTitle() {
 
 /** 量看画面这一节（根节点，横竖切换时它本身不换、不转）来判断横竖 */
 function measureRoot() {
+  if (live.rootW !== liveRoot.clientWidth || live.rootH !== liveRoot.clientHeight) resetGesture();
   live.rootW = liveRoot.clientWidth;
   live.rootH = liveRoot.clientHeight;
   const sys = live.rootW > live.rootH && live.rootH > 0;
@@ -1214,6 +1280,7 @@ function layoutFrame() {
   }
   const w = Math.floor(fit.w);
   const h = Math.floor(fit.h);
+  if (frameBox.style.width !== `${w}px` || frameBox.style.height !== `${h}px`) resetGesture();
   frameBox.style.width = `${w}px`;
   frameBox.style.height = `${h}px`;
   frameBox.style.visibility = '';
@@ -1239,11 +1306,13 @@ function setView(view) {
   screenLayer.style.transform = view.scale === 1 && !view.tx && !view.ty
     ? '' : `translate(${view.tx}px, ${view.ty}px) scale(${view.scale})`;
   const zoomed = isZoomed(view.scale);
+  liveHint.textContent = zoomed ? '单指挪画面 · 长按拖动控件' : '点按网页 · 上下滑滚动 · 长按拖动控件 · 两指捏放大';
   zoomButton.hidden = !zoomed;
   if (zoomed) zoomButton.textContent = `${view.scale.toFixed(1)}×`;
 }
 
 function resetZoom() {
+  resetGesture();
   setView({ scale: 1, tx: 0, ty: 0 });
   if (live.viewer) live.viewer.detail(false);
 }
@@ -1253,9 +1322,12 @@ const clipBox = () => ({ w: clip.clientWidth, h: clip.clientHeight });
 // ── 手势 ──
 
 function resetGesture() {
+  if (live.holdTimer !== null) clearTimeout(live.holdTimer);
+  live.holdTimer = null;
+  if (live.viewer) live.viewer.cancelDrag();
   live.tracker.reset();
+  live.downClient = null;
   live.pinch = null;
-  live.panBase = null;
   live.scrollAnchor = null;
   live.acc.reset();
   if (live.flushTimer !== null) clearTimeout(live.flushTimer);
@@ -1280,6 +1352,20 @@ function flushScroll() {
 function handle(intents) {
   for (const intent of intents) {
     switch (intent.kind) {
+      case 'remote-start':
+      case 'remote-move':
+      case 'remote-end': {
+        // 先换回屏幕坐标，再复用点按的缩放和平移、旋转换算。
+        const client = live.rotate ? { x: -intent.y, y: intent.x } : intent;
+        const pt = toFrame(client.x, client.y);
+        if (pt && live.viewer) live.viewer.drag(intent.kind === 'remote-start' ? 'start'
+          : intent.kind === 'remote-move' ? 'move' : 'end', pt);
+        else if (live.viewer) live.viewer.cancelDrag();
+        break;
+      }
+      case 'remote-cancel':
+        if (live.viewer) live.viewer.cancelDrag();
+        break;
       case 'tap': {
         const down = live.downClient;
         const pt = down && toFrame(down.x, down.y);
@@ -1302,21 +1388,18 @@ function handle(intents) {
         }
         break;
       }
-      case 'hdrag': {
-        // 放大着：横着拖是挪画面看左右两边；没放大时横着拖不做事
-        if (!isZoomed(live.view.scale)) break;
-        if (live.panBase === null) live.panBase = live.view.tx;
-        setView(panView(live.view, live.panBase + intent.dx, clipBox()));
+      case 'pan-view': {
+        setView(panView(live.view, live.view.tx + intent.dx, clipBox(), live.view.ty + intent.dy));
         break;
       }
+      // 原大小横划不切网页，也不向网页发操作；选择网页始终回列表。
+      case 'hdrag':
       case 'hrelease':
       case 'hcancel':
-        live.panBase = null;
         break;
       case 'pinch-start':
         flushScroll();
         live.acc.reset();
-        live.panBase = null;
         live.pinch = pinchStart(intent.a, intent.b, live.view);
         break;
       case 'pinch-move': {
@@ -1339,6 +1422,10 @@ function handle(intents) {
         break;
     }
   }
+  if (!live.tracker.waitingForHold && live.holdTimer !== null) {
+    clearTimeout(live.holdTimer);
+    live.holdTimer = null;
+  }
   if (!live.tracker.active) {
     flushScroll();
     live.scrollAnchor = null;
@@ -1349,17 +1436,25 @@ function handle(intents) {
 canvas.addEventListener('pointerdown', (event) => {
   if (event.pointerType === 'mouse' && event.button !== 0) return;
   event.preventDefault();
-  if (!live.tracker.active) {
+  if (!liveReady() || !live.viewer || !live.viewer.live) return;
+  const first = !live.tracker.active;
+  if (first) {
     live.downClient = { x: event.clientX, y: event.clientY };
     live.scrollAnchor = null;
   }
   try {
     canvas.setPointerCapture(event.pointerId);
   } catch {
-    // 拿不到也能用，只是手指滑出画面会丢掉抬手
+    // 拿不到时由 pointerleave 取消，避免遗漏松手。
   }
   const p = viewPoint(event.clientX, event.clientY, live.rotate);
-  handle(live.tracker.down(event.pointerId, p.x, p.y));
+  handle(live.tracker.down(event.pointerId, p.x, p.y, Date.now(), isZoomed(live.view.scale)));
+  if (first) {
+    live.holdTimer = setTimeout(() => {
+      live.holdTimer = null;
+      handle(live.tracker.hold());
+    }, LONG_PRESS_MS);
+  }
 });
 canvas.addEventListener('pointermove', (event) => {
   const p = viewPoint(event.clientX, event.clientY, live.rotate);
@@ -1377,6 +1472,9 @@ canvas.addEventListener('pointerup', (event) => {
 const cancelPointer = (event) => handle(live.tracker.cancel(event.pointerId));
 canvas.addEventListener('pointercancel', cancelPointer);
 canvas.addEventListener('lostpointercapture', cancelPointer);
+canvas.addEventListener('pointerleave', (event) => {
+  if (!canvas.hasPointerCapture(event.pointerId)) cancelPointer(event);
+});
 canvas.addEventListener('contextmenu', (event) => event.preventDefault());
 // iOS Safari 不理 user-scalable=no：在画面上两指捏时别让整页跟着缩放
 for (const type of ['gesturestart', 'gesturechange', 'gestureend']) {

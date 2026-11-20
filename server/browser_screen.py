@@ -18,7 +18,11 @@ Viewer protocol, after POST /stream and the WebSocket auth message:
             frames: 4-byte big-endian generation + JPEG. A frame tagged with an
             older generation belongs to the previously selected page.
   client -> tap {x, y, width, height} and scroll {..., dx, dy} in frame
-            pixels; text {text}; key {key}; detail {on}; ping
+            pixels (optional generation for older clients); drag
+            {phase: start|move|end|cancel, x, y, width, height, generation}
+            in the same pixels, with the generation of the displayed frame;
+            text {text}; key {key}; detail {on}; ping
+            A main-frame navigation also sends selected with a new generation.
   server -> closed {id} / warn {error} / pong; error {error} + stopped at the end
 """
 
@@ -205,6 +209,15 @@ class _Frame:
 
 
 @dataclass
+class _Drag:
+    cdp: _Cdp
+    generation: int
+    x: float
+    y: float
+    release_task: asyncio.Task[None] | None = None
+
+
+@dataclass
 class _Session:
     id: str
     viewer_token: str
@@ -220,6 +233,7 @@ class _Session:
     cdp: _Cdp | None = None
     generation: int = 0
     viewport: tuple[float, float] = (0.0, 0.0)
+    drag: _Drag | None = None
     detail: bool = False
     # The listed page to hand the window back to when the viewer leaves:
     # whichever was in front before the first select, or whichever later
@@ -579,7 +593,7 @@ def _control(payload: dict[str, Any]) -> dict[str, Any]:
         target_id = payload.get("id")
         if isinstance(target_id, str) and TARGET_ID_RE.fullmatch(target_id):
             return {"type": kind, "id": target_id}
-    elif kind in ("tap", "scroll"):
+    elif kind in ("tap", "scroll", "drag"):
         width = _integer(payload, "width", 1, MAX_DIMENSION)
         height = _integer(payload, "height", 1, MAX_DIMENSION)
         control = {
@@ -591,6 +605,13 @@ def _control(payload: dict[str, Any]) -> dict[str, Any]:
         if kind == "scroll":
             control["dx"] = _integer(payload, "dx", -MAX_DIMENSION, MAX_DIMENSION)
             control["dy"] = _integer(payload, "dy", -MAX_DIMENSION, MAX_DIMENSION)
+        if kind == "drag":
+            phase = payload.get("phase")
+            if not isinstance(phase, str) or phase not in ("start", "move", "end", "cancel"):
+                raise _ProtocolError("invalid_control")
+            control["phase"] = phase
+        if kind == "drag" or "generation" in payload:
+            control["generation"] = _integer(payload, "generation", 0, 0xFFFFFFFF)
         return control
     elif kind == "text":
         text = payload.get("text")
@@ -627,9 +648,20 @@ def _enqueue(session: _Session, control: dict[str, Any]) -> None:
         # Internal housekeeping is never refused and never queued twice.
         if control in queue:
             return
-        queue.append(control)
+        # Release on navigation/closure before any queued input can hit a new DOM.
+        if kind in ("_recast", "_gone"):
+            queue.appendleft(control)
+        else:
+            queue.append(control)
+    elif (kind == "drag" and control["phase"] == "move" and last is not None
+          and last["type"] == "drag" and last["phase"] == "move"
+          and (last["generation"], last["width"], last["height"])
+          == (control["generation"], control["width"], control["height"])):
+        # Only unsent moves collapse; press/release/cancel remain ordered barriers.
+        last.update(x=control["x"], y=control["y"])
     elif (kind == "scroll" and last is not None and last["type"] == "scroll"
-          and (last["width"], last["height"]) == (control["width"], control["height"])):
+          and (last["width"], last["height"], last.get("generation"))
+          == (control["width"], control["height"], control.get("generation"))):
         # Finger-follow scrolling sends a stream of small moves; while the page
         # is busy, unsent moves merge instead of piling up.
         last.update(
@@ -712,6 +744,7 @@ async def _restart_cast(session: _Session) -> None:
 
 
 async def _stop_cast(session: _Session) -> None:
+    await _release_drag(session)
     session.generation += 1
     cdp, session.cdp, session.target_id, session.frame = session.cdp, None, None, None
     if cdp is None:
@@ -785,6 +818,62 @@ async def _tap(cdp: _Cdp, x: float, y: float) -> None:
         await cdp.call("Input.dispatchMouseEvent", event)
 
 
+async def _release_drag(session: _Session) -> None:
+    drag = session.drag
+    if drag is None:
+        return
+    if drag.release_task is None:
+        async def release() -> None:
+            try:
+                await drag.cdp.call("Input.dispatchMouseEvent", {
+                    "type": "mouseReleased", "x": drag.x, "y": drag.y,
+                    "button": "left", "buttons": 0, "clickCount": 1,
+                }, timeout=QUICK_TIMEOUT_SECONDS)
+            except _CdpError:
+                # A vanished page cannot receive input; never release on a different page.
+                pass
+
+        drag.release_task = asyncio.create_task(release())
+    # Cancellation of a control must not cancel or resend its release. Teardown
+    # joins the same task, including when its CDP command has not been sent yet.
+    await asyncio.shield(drag.release_task)
+    if session.drag is drag:
+        session.drag = None
+
+
+async def _drag_input(session: _Session, phase: str, x: float, y: float) -> None:
+    cdp = session.cdp
+    if phase == "start":
+        await _release_drag(session)
+        await cdp.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y,
+                                                    "buttons": 0})
+        # Record before awaiting: cancellation/error may follow a delivered press.
+        session.drag = _Drag(cdp, session.generation, x, y)
+        await cdp.call("Input.dispatchMouseEvent", {
+            "type": "mousePressed", "x": x, "y": y,
+            "button": "left", "buttons": 1, "clickCount": 1,
+        })
+    elif session.drag is not None:
+        drag = session.drag
+        if drag.cdp is not cdp or drag.generation != session.generation:
+            await _release_drag(session)
+            return
+        if phase == "cancel":
+            # Cancellation drops an unfinished endpoint; release where the last
+            # acknowledged move left the pointer, without moving the control.
+            await _release_drag(session)
+        else:
+            if phase == "move" or (x, y) != (drag.x, drag.y):
+                # The client throttles moves; the final endpoint may only arrive
+                # in end. Controls listening to mousemove need that last segment.
+                await cdp.call("Input.dispatchMouseEvent", {
+                    "type": "mouseMoved", "x": x, "y": y, "button": "left", "buttons": 1,
+                })
+                drag.x, drag.y = x, y
+            if phase == "end":
+                await _release_drag(session)
+
+
 async def _press(cdp: _Cdp, name: str) -> None:
     key = KEYS[name]
     down = dict(key, type="keyDown" if "text" in key else "rawKeyDown")
@@ -795,16 +884,22 @@ async def _press(cdp: _Cdp, name: str) -> None:
 
 
 async def _apply_input(session: _Session, control: dict[str, Any]) -> None:
+    if "generation" in control and control["generation"] != session.generation:
+        return   # A queued gesture must never reach the newly selected page.
     cdp = session.cdp
     if cdp is None:
         await session.viewer.send({"type": "warn", "error": "no_window"})
         return
     kind = control["type"]
-    if kind in ("tap", "scroll"):
+    if kind != "drag":
+        await _release_drag(session)
+    if kind in ("tap", "scroll", "drag"):
         scale_x, scale_y = _frame_scale(control, session.viewport)
         x, y = round(control["x"] * scale_x, 1), round(control["y"] * scale_y, 1)
         if kind == "tap":
             await _tap(cdp, x, y)
+        elif kind == "drag":
+            await _drag_input(session, control["phase"], x, y)
         else:
             await cdp.call("Input.dispatchMouseEvent", {
                 "type": "mouseWheel", "x": x, "y": y,
@@ -827,6 +922,13 @@ async def _apply(session: _Session, control: dict[str, Any]) -> None:
             await _restart_cast(session)
     elif kind == "_recast":
         if control["generation"] == session.generation:
+            await _release_drag(session)
+            session.generation += 1
+            frame, session.frame = session.frame, None
+            if frame is not None:
+                _ack_later(session, frame)
+            await session.viewer.send({"type": "selected", "id": session.target_id,
+                                       "generation": session.generation})
             await _restart_cast(session)
     elif kind == "_gone":
         if control["id"] == session.target_id:
@@ -849,6 +951,7 @@ async def _run_controls(session: _Session) -> None:
             try:
                 await _apply(session, control)
             except _CdpError as exc:
+                await _release_drag(session)
                 log.info("vscreen %s failed: %s", control["type"], exc)
                 if not control["type"].startswith("_"):
                     await session.viewer.send({"type": "warn", "error": "input_failed"})

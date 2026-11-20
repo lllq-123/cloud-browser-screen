@@ -92,6 +92,11 @@ export function tapMessage(pt) {
   return { type: 'tap', x: toInt(pt.x, 0, width - 1), y: toInt(pt.y, 0, height - 1), width, height };
 }
 
+/** 长按拖动的落点也按帧图像素发送；generation 取自实际绘出的那一帧。 */
+export function dragMessage(pt, phase, generation) {
+  return { ...tapMessage(pt), type: 'drag', phase, generation };
+}
+
 export function scrollMessage(pt, dx, dy) {
   return { ...tapMessage(pt), type: 'scroll',
     dx: toInt(dx, -MAX_DIMENSION, MAX_DIMENSION), dy: toInt(dy, -MAX_DIMENSION, MAX_DIMENSION) };
@@ -268,9 +273,9 @@ export function pinchView(start, a, b, origin, box) {
   return { scale, ...clampPan(scale, tx, ty, box) };
 }
 
-/** 放大后单指横着拖：只挪左右 */
-export function panView(view, tx, box) {
-  return { scale: view.scale, ...clampPan(view.scale, tx, view.ty, box) };
+/** 放大后单指拖动：两轴一起平移，画面始终盖住框。省略 ty 时保持原来的竖向位置。 */
+export function panView(view, tx, box, ty = view.ty) {
+  return { scale: view.scale, ...clampPan(view.scale, tx, ty, box) };
 }
 
 /** 捏完松手：几乎没放大就弹回原样 */
@@ -282,14 +287,17 @@ export function snapView(view) {
 
 /** 手指挪过这么远（眼里的像素）才算「在滑」，以内都算点一下 */
 export const TOUCH_SLOP = 12;
+export const LONG_PRESS_MS = 400;
 
 /**
  * 判定一轮触摸是什么手势。坐标都是 viewPoint 换过的。说出来的意图：
- *   tap {x, y} / scroll {dy} / hdrag {dx} / hrelease {dx} / hcancel
+ *   tap {x, y} / scroll {dy} / pan-view {dx, dy} / hdrag {dx} / hrelease {dx} / hcancel
+ *   remote-start / remote-move / remote-end {x, y} / remote-cancel
  *   pinch-start {a, b} / pinch-move {a, b} / pinch-end
  *
  * - 没挪出 TOUCH_SLOP 就抬手 = 点一下（落点用按下的位置，抬手时手指常会滑一点）
- * - 挪出去以后按第一下的方向锁定：竖着 = 跟手滚，横着 = 拖（放大时用来挪画面）
+ * - 原大小时竖划滚网页，横划不操作；放大时沿手指的两个方向平移画面。
+ * - 单指没挪出死区、按住满 400ms 后拖动网页控件，与平移、滚动、点击互斥。
  * - 这一轮只要出现过第二根手指，就是捏合：之后谁抬手都不算点击。
  *   捏完两根手指是一根一根抬的，最后那根看着跟单指点一下一模一样。
  */
@@ -297,36 +305,58 @@ export class GestureTracker {
   constructor() {
     this.fingers = new Map();
     this.start = null;
-    this.axis = 'none';
+    this.motion = 'none';
     this.lastY = 0;
     this.multi = false;
+    this.pressedAt = 0;
+    this.remote = false;
   }
 
   get active() {
     return this.fingers.size > 0;
   }
 
-  down(id, x, y) {
+  get waitingForHold() {
+    return !!this.start && !this.multi && !this.remote && this.motion === 'none';
+  }
+
+  hold(now = Date.now()) {
+    if (!this.waitingForHold || now - this.pressedAt < LONG_PRESS_MS) return [];
+    const start = this.start;
+    this.remote = true;
+    const latest = this.fingers.get(start.id);
+    const out = [{ kind: 'remote-start', x: start.x, y: start.y }];
+    if (latest.x !== start.x || latest.y !== start.y) out.push({ kind: 'remote-move', ...latest });
+    return out;
+  }
+
+  down(id, x, y, now = Date.now(), zoomed = false) {
     this.fingers.set(id, { x, y });
     if (this.fingers.size === 1 && !this.multi) {
-      this.start = { id, x, y };
-      this.axis = 'none';
+      this.start = { id, x, y, zoomed };
+      this.motion = 'none';
       this.lastY = y;
+      this.pressedAt = now;
+      this.remote = false;
       return [];
     }
     // 第二根手指落下：这一轮从此是捏合
     const out = [];
-    if (!this.multi && this.axis === 'h') out.push({ kind: 'hcancel' });
+    if (this.remote) out.push({ kind: 'remote-cancel' });
+    this.remote = false;
+    if (!this.multi && this.motion === 'h') out.push({ kind: 'hcancel' });
     this.multi = true;
     this.start = null;
-    this.axis = 'none';
+    this.motion = 'none';
     const pair = this.pair();
     if (pair) out.push({ kind: 'pinch-start', a: pair[0], b: pair[1] });
     return out;
   }
 
-  move(id, x, y) {
-    if (!this.fingers.has(id)) return [];
+  move(id, x, y, now = Date.now()) {
+    const previous = this.fingers.get(id);
+    if (!previous) return [];
+    const held = this.hold(now);
     this.fingers.set(id, { x, y });
     if (this.multi) {
       const pair = this.pair();
@@ -334,32 +364,48 @@ export class GestureTracker {
     }
     const start = this.start;
     if (!start || start.id !== id) return [];
+    if (this.remote) return [...held, { kind: 'remote-move', x, y }];
     const dx = x - start.x;
     const dy = y - start.y;
-    if (this.axis === 'none') {
+    if (this.motion === 'none') {
       if (Math.hypot(dx, dy) <= TOUCH_SLOP) return [];
-      this.axis = Math.abs(dx) > Math.abs(dy) ? 'h' : 'v';
+      if (start.zoomed) {
+        this.motion = 'pan';
+        return [{ kind: 'pan-view', dx, dy }];
+      }
+      this.motion = Math.abs(dx) > Math.abs(dy) ? 'h' : 'v';
       // 从锁定那一刻起算，前面那段死区不补发，免得一锁定就猛跳一下
       this.lastY = y;
-      return this.axis === 'h' ? [{ kind: 'hdrag', dx }] : [];
+      return this.motion === 'h' ? [{ kind: 'hdrag', dx }] : [];
     }
-    if (this.axis === 'h') return [{ kind: 'hdrag', dx }];
+    if (this.motion === 'pan') return [{ kind: 'pan-view', dx: x - previous.x, dy: y - previous.y }];
+    if (this.motion === 'h') return [{ kind: 'hdrag', dx }];
     const step = y - this.lastY;
     this.lastY = y;
     return step ? [{ kind: 'scroll', dy: step }] : [];
   }
 
-  up(id, x, y) {
-    if (!this.fingers.has(id)) return [];
+  up(id, x, y, now = Date.now()) {
+    const previous = this.fingers.get(id);
+    if (!previous) return [];
+    // 主线程忙时定时器可能稍晚，满 400ms 的松手不能漏成一次点击。
+    const held = this.hold(now);
     this.fingers.delete(id);
     if (this.multi) return this.afterMultiLift();
     const start = this.start;
     this.start = null;
-    const axis = this.axis;
-    this.axis = 'none';
+    const motion = this.motion;
+    this.motion = 'none';
     if (!start || start.id !== id) return [];
-    if (axis === 'h') return [{ kind: 'hrelease', dx: x - start.x }];
-    if (axis === 'v') {
+    if (this.remote) {
+      this.remote = false;
+      return [...held, { kind: 'remote-end', x, y }];
+    }
+    if (motion === 'pan') {
+      return x === previous.x && y === previous.y ? [] : [{ kind: 'pan-view', dx: x - previous.x, dy: y - previous.y }];
+    }
+    if (motion === 'h') return [{ kind: 'hrelease', dx: x - start.x }];
+    if (motion === 'v') {
       const step = y - this.lastY;
       return step ? [{ kind: 'scroll', dy: step }] : [];
     }
@@ -371,9 +417,11 @@ export class GestureTracker {
     if (!this.fingers.has(id)) return [];
     this.fingers.delete(id);
     if (this.multi) return this.afterMultiLift();
-    const out = this.axis === 'h' ? [{ kind: 'hcancel' }] : [];
+    const out = this.remote ? [{ kind: 'remote-cancel' }]
+      : this.motion === 'h' ? [{ kind: 'hcancel' }] : [];
+    this.remote = false;
     this.start = null;
-    this.axis = 'none';
+    this.motion = 'none';
     return out;
   }
 
@@ -391,8 +439,9 @@ export class GestureTracker {
   reset() {
     this.fingers.clear();
     this.start = null;
-    this.axis = 'none';
+    this.motion = 'none';
     this.multi = false;
+    this.remote = false;
   }
 
   pair() {

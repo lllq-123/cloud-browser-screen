@@ -217,6 +217,10 @@ class BrowserScreenTests(unittest.IsolatedAsyncioTestCase):
         socket.disconnect()
         await asyncio.wait_for(task, 1)
 
+    def drag(self, phase, generation, x=100, y=100):
+        return {"type": "drag", "phase": phase, "generation": generation,
+                "x": x, "y": y, "width": 960, "height": 448}
+
     async def test_window_list_keeps_only_real_pages_newest_first(self):
         self.browser.targets[:0] = [
             {"id": "0B1A000000000000000000000000000D", "type": "page", "url": "about:blank", "title": ""},
@@ -343,6 +347,310 @@ class BrowserScreenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([wheel["deltaY"] for wheel in self.browser.methods("Input.dispatchMouseEvent")],
                          [20.0, 180.2])
         await self.leave(socket, task)
+
+    async def test_drag_validates_phase_generation_and_frame_coordinates(self):
+        valid = self.drag("start", 1)
+        for change in ({"phase": "hover"}, {"phase": []}, {"generation": None},
+                       {"generation": True}, {"generation": -1}, {"generation": 2**32},
+                       {"x": 960}, {"y": -1}, {"width": 0}, {"height": 448.5}):
+            with self.subTest(change=change):
+                with self.assertRaises(browser_screen._ProtocolError):
+                    browser_screen._control({**valid, **change})
+        no_generation = dict(valid)
+        del no_generation["generation"]
+        with self.assertRaises(browser_screen._ProtocolError):
+            browser_screen._control(no_generation)
+        self.assertEqual(browser_screen._control({**valid, "method": "Runtime.evaluate",
+                                                 "button": "right"}), valid)
+
+    async def test_drag_press_move_and_release_follow_frame_coordinates(self):
+        socket, task = await self.open_viewer()
+        selected = await self.select(socket, PAGE_X)
+        generation = selected["generation"]
+        socket.push(self.drag("start", generation, 100, 100))
+        socket.push(self.drag("move", generation, 240, 200))
+        socket.push(self.drag("end", generation, 480, 224))
+        await self.browser.wait_for_call("Input.dispatchMouseEvent", count=5)
+        mouse = self.browser.methods("Input.dispatchMouseEvent", PAGE_X)
+        self.assertEqual([(m["type"], m["x"], m["y"], m["buttons"]) for m in mouse], [
+            ("mouseMoved", 200.0, 200.2, 0), ("mousePressed", 200.0, 200.2, 1),
+            ("mouseMoved", 480.0, 400.4, 1), ("mouseMoved", 960.0, 448.5, 1),
+            ("mouseReleased", 960.0, 448.5, 0),
+        ])
+        self.assertIsNone(browser_screen._session.drag)
+        await self.leave(socket, task)
+        self.assertEqual(len(self.browser.methods("Input.dispatchMouseEvent")), 5)
+
+    async def test_drag_end_without_a_move_delivers_only_a_changed_endpoint(self):
+        for end_x in (100, 240):
+            with self.subTest(end_x=end_x):
+                socket, task = await self.open_viewer()
+                generation = (await self.select(socket, PAGE_X))["generation"]
+                before = len(self.browser.methods("Input.dispatchMouseEvent"))
+                socket.push(self.drag("start", generation))
+                socket.push(self.drag("end", generation, x=end_x))
+                expected = [("mouseMoved", 200.0, 0), ("mousePressed", 200.0, 1)]
+                if end_x != 100:
+                    expected.append(("mouseMoved", 480.0, 1))
+                expected.append(("mouseReleased", end_x * 2.0, 0))
+                await self.browser.wait_for_call("Input.dispatchMouseEvent", count=before + len(expected))
+                mouse = self.browser.methods("Input.dispatchMouseEvent")[before:]
+                self.assertEqual([(m["type"], m["x"], m["buttons"]) for m in mouse], expected)
+                await self.leave(socket, task)
+
+    async def test_busy_drag_moves_merge_without_losing_end_or_cancel(self):
+        socket, task = await self.open_viewer()
+        generation = (await self.select(socket, PAGE_X))["generation"]
+        gate = self.browser.hold["Input.dispatchMouseEvent"] = asyncio.Event()
+        socket.push(self.drag("start", generation))
+        await self.browser.wait_for_call("Input.dispatchMouseEvent")
+        for x in (110, 120, 130):
+            socket.push(self.drag("move", generation, x=x))
+        socket.push(self.drag("cancel", generation, x=140))
+        await _until(lambda: len(browser_screen._session.controls) == 2)
+        self.assertEqual([(c["phase"], c["x"]) for c in browser_screen._session.controls],
+                         [("move", 130), ("cancel", 140)])
+        gate.set()
+        await self.browser.wait_for_call("Input.dispatchMouseEvent", count=4)
+        mouse = self.browser.methods("Input.dispatchMouseEvent")
+        self.assertEqual([(m["type"], m["x"]) for m in mouse], [
+            ("mouseMoved", 200.0), ("mousePressed", 200.0),
+            ("mouseMoved", 260.0), ("mouseReleased", 260.0),
+        ])
+        # Unmatched tail events must not turn into a new press or move.
+        socket.push(self.drag("move", generation))
+        socket.push(self.drag("end", generation))
+        socket.push({"type": "key", "key": "Tab"})
+        await self.browser.wait_for_call("Input.dispatchKeyEvent", count=2)
+        self.assertEqual(len(self.browser.methods("Input.dispatchMouseEvent")), 4)
+        await self.leave(socket, task)
+
+    async def test_drag_releases_on_disconnect_select_protocol_error_and_page_closure(self):
+        for reason in ("disconnect", "select", "protocol_error", "page_closed", "replace"):
+            with self.subTest(reason=reason):
+                socket, task = await self.open_viewer()
+                generation = (await self.select(socket, PAGE_X))["generation"]
+                before = len(self.browser.methods("Input.dispatchMouseEvent", PAGE_X))
+                socket.push(self.drag("start", generation, 240, 200))
+                await self.browser.wait_for_call("Input.dispatchMouseEvent", PAGE_X, before + 2)
+                if reason == "select":
+                    await self.select(socket, PAGE_Y)
+                    await self.leave(socket, task)
+                elif reason == "protocol_error":
+                    socket.push({"type": "cdp", "method": "Runtime.evaluate"})
+                    await asyncio.wait_for(task, 1)
+                elif reason == "page_closed":
+                    self.browser.remove(PAGE_X)
+                    browser_screen._session.poke.set()
+                    await socket.wait_for(lambda m: m == {"type": "closed", "id": PAGE_X})
+                    await self.leave(socket, task)
+                    self.browser.add(PAGE_X, "https://example.com/", "ordinary page")
+                elif reason == "replace":
+                    next_socket, next_task = await self.open_viewer()
+                    await asyncio.wait_for(task, 1)
+                    await self.leave(next_socket, next_task)
+                else:
+                    await self.leave(socket, task)
+                events = self.browser.methods("Input.dispatchMouseEvent", PAGE_X)[before:]
+                self.assertEqual([e["type"] for e in events],
+                                 ["mouseMoved", "mousePressed", "mouseReleased"])
+                self.assertEqual((events[-1]["x"], events[-1]["y"], events[-1]["buttons"]),
+                                 (480.0, 400.4, 0))
+                self.assertEqual(self.browser.methods("Input.dispatchMouseEvent", PAGE_Y), [])
+
+    async def test_stale_generations_never_deliver_input_to_a_new_page(self):
+        socket, task = await self.open_viewer()
+        old = (await self.select(socket, PAGE_X))["generation"]
+        new = (await self.select(socket, PAGE_Y))["generation"]
+        for phase in ("start", "move", "end", "cancel"):
+            socket.push(self.drag(phase, old))
+        socket.push({"type": "tap", "generation": old, "x": 1, "y": 1, "width": 960, "height": 448})
+        socket.push({"type": "scroll", "generation": old, "x": 1, "y": 1,
+                     "width": 960, "height": 448, "dx": 0, "dy": 10})
+        socket.push(self.drag("start", new))
+        # An old cancel must not release the current generation's drag.
+        socket.push(self.drag("cancel", old))
+        socket.push(self.drag("end", new, x=200))
+        await self.browser.wait_for_call("Input.dispatchMouseEvent", count=4)
+        self.assertEqual([e["type"] for e in self.browser.methods("Input.dispatchMouseEvent")],
+                         ["mouseMoved", "mousePressed", "mouseMoved", "mouseReleased"])
+        self.assertEqual(self.browser.methods("Input.dispatchMouseEvent", PAGE_X), [])
+        await self.leave(socket, task)
+
+    async def test_navigation_releases_drag_and_invalidates_queued_old_input(self):
+        socket, task = await self.open_viewer()
+        old = (await self.select(socket, PAGE_X))["generation"]
+        await socket.wait_for(lambda m: isinstance(m, bytes))
+        socket.push(self.drag("start", old))
+        await self.browser.wait_for_call("Input.dispatchMouseEvent", count=2)
+        cdp = self.browser.live(PAGE_X)
+        # Keep an unsent cast frame in the mailbox while navigation invalidates it.
+        browser_screen._session.frame = browser_screen._Frame(b"unsent-old-frame", old, cdp, 31)
+        cdp.emit("Page.frameNavigated", {"frame": {"id": "main", "url": "https://example.com/"}})
+        socket.push(self.drag("move", old, x=200))
+        socket.push(self.drag("start", old, x=300))
+        selected = await socket.wait_for(lambda m: isinstance(m, dict) and m.get("type") == "selected"
+                                         and m["generation"] != old)
+        await self.browser.wait_for_call("Page.startScreencast", count=2)
+        await self.browser.wait_for_call("Page.screencastFrameAck")
+        self.assertIn({"sessionId": 31}, self.browser.methods("Page.screencastFrameAck"))
+        self.assertNotIn(struct.pack(">I", old) + b"unsent-old-frame", socket.frames())
+        socket.push({"type": "key", "key": "Tab"})
+        await self.browser.wait_for_call("Input.dispatchKeyEvent", count=2)
+        self.assertEqual([e["type"] for e in self.browser.methods("Input.dispatchMouseEvent")],
+                         ["mouseMoved", "mousePressed", "mouseReleased"])
+        cdp.emit("Page.screencastFrame", {"data": _b64("after-navigation"), "sessionId": 1,
+                                          "metadata": {}})
+        await socket.wait_for(lambda m: m == struct.pack(">I", selected["generation"]) + b"after-navigation")
+        await self.leave(socket, task)
+
+    async def test_drag_press_failure_and_cancellation_release_on_original_connection(self):
+        for failure in ("error", "disconnect"):
+            with self.subTest(failure=failure):
+                socket, task = await self.open_viewer()
+                generation = (await self.select(socket, PAGE_X))["generation"]
+                cdp = self.browser.live(PAGE_X)
+                original_call = cdp.call
+                pressed = asyncio.Event()
+
+                async def interrupt_press(method, params=None, timeout=None):
+                    result = await original_call(method, params, timeout)
+                    if method == "Input.dispatchMouseEvent" and params["type"] == "mousePressed":
+                        pressed.set()
+                        if failure == "error":
+                            raise browser_screen._CdpError("press acknowledgement lost")
+                        await asyncio.Event().wait()
+                    return result
+
+                cdp.call = interrupt_press
+                before = len(self.browser.methods("Input.dispatchMouseEvent"))
+                socket.push(self.drag("start", generation))
+                await asyncio.wait_for(pressed.wait(), 1)
+                if failure == "error":
+                    await socket.wait_for(lambda m: m == {"type": "warn", "error": "input_failed"})
+                await self.leave(socket, task)
+                self.assertEqual([m["type"] for m in self.browser.methods("Input.dispatchMouseEvent")[before:]],
+                                 ["mouseMoved", "mousePressed", "mouseReleased"])
+
+    async def test_failed_or_cancelled_final_move_releases_at_last_acknowledged_position(self):
+        for failure in ("error", "disconnect"):
+            with self.subTest(failure=failure):
+                socket, task = await self.open_viewer()
+                generation = (await self.select(socket, PAGE_X))["generation"]
+                before = len(self.browser.methods("Input.dispatchMouseEvent"))
+                socket.push(self.drag("start", generation))
+                socket.push(self.drag("move", generation, x=120))
+                await self.browser.wait_for_call("Input.dispatchMouseEvent", count=before + 3)
+                cdp = self.browser.live(PAGE_X)
+                original_call = cdp.call
+                final_move = asyncio.Event()
+
+                async def interrupt_final_move(method, params=None, timeout=None):
+                    result = await original_call(method, params, timeout)
+                    if (method == "Input.dispatchMouseEvent" and params["type"] == "mouseMoved"
+                            and params["x"] == 400.0):
+                        final_move.set()
+                        if failure == "error":
+                            raise browser_screen._CdpError("move acknowledgement lost")
+                        await asyncio.Event().wait()
+                    return result
+
+                cdp.call = interrupt_final_move
+                socket.push(self.drag("end", generation, x=200))
+                await asyncio.wait_for(final_move.wait(), 1)
+                if failure == "error":
+                    await socket.wait_for(lambda m: m == {"type": "warn", "error": "input_failed"})
+                await self.leave(socket, task)
+                mouse = self.browser.methods("Input.dispatchMouseEvent")[before:]
+                self.assertEqual([(m["type"], m["x"], m["buttons"]) for m in mouse], [
+                    ("mouseMoved", 200.0, 0), ("mousePressed", 200.0, 1),
+                    ("mouseMoved", 240.0, 1), ("mouseMoved", 400.0, 1),
+                    ("mouseReleased", 240.0, 0),
+                ])
+
+    async def test_disconnect_joins_release_before_dispatch_or_while_ack_is_pending(self):
+        for held_at in ("before_dispatch", "after_dispatch"):
+            with self.subTest(held_at=held_at):
+                socket, task = await self.open_viewer()
+                generation = (await self.select(socket, PAGE_X))["generation"]
+                session = browser_screen._session
+                cdp = self.browser.live(PAGE_X)
+                original_call = cdp.call
+                release_started, gate = asyncio.Event(), asyncio.Event()
+                attempts = []
+
+                async def held_release(method, params=None, timeout=None):
+                    if method != "Input.dispatchMouseEvent" or params["type"] != "mouseReleased":
+                        return await original_call(method, params, timeout)
+                    attempts.append(params)
+                    if held_at == "before_dispatch":
+                        release_started.set()
+                        await gate.wait()
+                    result = await original_call(method, params, timeout)
+                    if held_at == "after_dispatch":
+                        release_started.set()
+                        await gate.wait()
+                    return result
+
+                cdp.call = held_release
+                before = len(self.browser.methods("Input.dispatchMouseEvent"))
+                socket.push(self.drag("start", generation))
+                socket.push(self.drag("cancel", generation, x=200))
+                await asyncio.wait_for(release_started.wait(), 1)
+                socket.disconnect()
+                await _until(lambda: session.stopping)
+                try:
+                    self.assertEqual(len(attempts), 1)
+                    self.assertFalse(session.drag.release_task.cancelled())
+                    released = [m for m in self.browser.methods("Input.dispatchMouseEvent")[before:]
+                                if m["type"] == "mouseReleased"]
+                    self.assertEqual(len(released), int(held_at == "after_dispatch"))
+                finally:
+                    gate.set()
+                    await asyncio.wait_for(task, 1)
+                mouse = self.browser.methods("Input.dispatchMouseEvent")[before:]
+                self.assertEqual([m["type"] for m in mouse],
+                                 ["mouseMoved", "mousePressed", "mouseReleased"])
+                self.assertEqual((mouse[-1]["x"], mouse[-1]["buttons"]), (200.0, 0))
+                self.assertIsNone(session.drag)
+                self.assertEqual(len(attempts), 1)
+
+    async def test_concurrent_release_waiters_share_one_command_after_cancellation(self):
+        cdp = await self.browser.connect(PAGE_X)
+        session = browser_screen._Session("test-session", "test-token")
+        session.drag = browser_screen._Drag(cdp, 1, 240.0, 200.2)
+        original_call = cdp.call
+        release_started, gate = asyncio.Event(), asyncio.Event()
+        attempts = []
+
+        async def held_release(method, params=None, timeout=None):
+            attempts.append(params)
+            release_started.set()
+            await gate.wait()
+            return await original_call(method, params, timeout)
+
+        cdp.call = held_release
+        first = asyncio.create_task(browser_screen._release_drag(session))
+        await asyncio.wait_for(release_started.wait(), 1)
+        second = asyncio.create_task(browser_screen._release_drag(session))
+        await asyncio.sleep(0)
+        first.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await first
+        teardown = asyncio.create_task(browser_screen._release_drag(session))
+        await asyncio.sleep(0)
+        try:
+            self.assertEqual(len(attempts), 1)
+            self.assertIsNotNone(session.drag)
+        finally:
+            gate.set()
+            await asyncio.wait_for(asyncio.gather(second, teardown), 1)
+            await cdp.close()
+        self.assertEqual(self.browser.methods("Input.dispatchMouseEvent"), [{
+            "type": "mouseReleased", "x": 240.0, "y": 200.2,
+            "button": "left", "buttons": 0, "clickCount": 1,
+        }])
+        self.assertIsNone(session.drag)
 
     async def test_only_the_newest_frame_is_sent_and_each_frame_is_acked_after_delivery(self):
         socket, task = await self.open_viewer()

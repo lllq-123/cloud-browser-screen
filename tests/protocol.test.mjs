@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import vm from 'node:vm';
 import * as P from '../web/protocol.js';
 
 // 虚拟屏幕前端的纯函数部分（web/protocol.js）
@@ -12,6 +14,109 @@ function play(steps) {
   return intents;
 }
 const kinds = (intents) => intents.map((intent) => intent.kind);
+
+// 在 Node 的独立上下文里运行实际 app.js。DOM、时钟和通道都由夹具提供，不开浏览器、不发请求。
+const appSource = await readFile(new URL('../web/app.js', import.meta.url), 'utf8');
+function appFixture() {
+  let now = 10000;
+  let timerId = 0;
+  const timers = new Map();
+  const later = (fn, delay = 0) => {
+    const id = ++timerId;
+    timers.set(id, { fn, at: now + delay });
+    return id;
+  };
+  const advance = (ms) => {
+    const until = now + ms;
+    for (;;) {
+      const next = [...timers].filter(([, t]) => t.at <= until).sort((a, b) => a[1].at - b[1].at)[0];
+      if (!next) break;
+      now = next[1].at;
+      timers.delete(next[0]);
+      next[1].fn();
+    }
+    now = until;
+  };
+  class Element {
+    constructor() {
+      this.style = {};
+      this.dataset = {};
+      this.children = [];
+      this.value = '';
+      this.clientWidth = 300;
+      this.clientHeight = 140;
+      this.width = this.height = 1;
+      this.listeners = new Map();
+      this.captures = new Set();
+      this.classList = { toggle() {} };
+    }
+    addEventListener(type, fn) {
+      const listeners = this.listeners.get(type) || [];
+      listeners.push(fn);
+      this.listeners.set(type, listeners);
+    }
+    fire(type, fields = {}) {
+      const event = { pointerId: 1, pointerType: 'touch', button: 0, clientX: 100, clientY: 90, preventDefault() {}, ...fields };
+      for (const fn of this.listeners.get(type) || []) fn(event);
+    }
+    querySelectorAll() { return []; }
+    setAttribute() {}
+    setPointerCapture(id) { this.captures.add(id); }
+    hasPointerCapture(id) { return this.captures.has(id); }
+    releasePointerCapture(id) { this.captures.delete(id); }
+    getBoundingClientRect() { return { left: 10, top: 20, right: 310, bottom: 160, width: 300, height: 140 }; }
+    getContext() { return { drawImage() {} }; }
+    focus() {}
+    blur() {}
+  }
+  const elements = new Map();
+  const element = (id) => {
+    if (!elements.has(id)) elements.set(id, new Element());
+    return elements.get(id);
+  };
+  const window = new Element();
+  const document = new Element();
+  Object.assign(document, { hidden: false, baseURI: 'https://example.test/screen/', activeElement: null,
+    getElementById: element, createElement: () => new Element() });
+  const context = vm.createContext({ ...P, document, window, URL, Blob, Uint8Array, ArrayBuffer, AbortController,
+    location: { hash: '', pathname: '/screen/', search: '', protocol: 'https:', host: 'example.test' },
+    history: { pushState() {}, back() {}, replaceState() {} },
+    localStorage: { getItem() { return 'fixture-token'; }, setItem() {}, removeItem() {} },
+    fetch: async () => { throw new Error('Fixture must not make requests'); },
+    createImageBitmap: async () => ({ width: 960, height: 448, close() {} }),
+    Date: class extends Date { static now() { return now; } },
+    GestureTracker: class extends P.GestureTracker {
+      down(id, x, y, at = now, zoomed = false) { return super.down(id, x, y, at, zoomed); }
+      move(id, x, y) { return super.move(id, x, y, now); }
+      up(id, x, y) { return super.up(id, x, y, now); }
+      hold() { return super.hold(now); }
+    },
+    WebSocket: { OPEN: 1 }, setTimeout: later, clearTimeout: (id) => timers.delete(id),
+    setInterval: later, clearInterval: (id) => timers.delete(id),
+  });
+  const source = appSource.replace(/import\s*\{[\s\S]*?\}\s*from '\.\/protocol\.js';/, '');
+  vm.runInContext(source.slice(0, source.indexOf('// ── 开始 ──')) + `
+    Viewer.prototype.start = function () {};
+    globalThis.testApp = { live, Viewer, resetGesture, setView, resetZoom, enterLive, leaveLive, pauseLive, applyLand,
+      stopPolling() { pageShown = false; }, currentView() { return currentView; } };
+  `, context);
+  const app = context.testApp;
+  element('view-live').clientWidth = 360;
+  element('view-live').clientHeight = 740;
+  app.enterLive('AB12CD34');
+  const viewer = app.live.viewer;
+  const sent = [];
+  const socket = { readyState: 1, bufferedAmount: 0, send: (data) => sent.push(JSON.parse(data)), close() { this.closed = true; } };
+  viewer.socket = socket;
+  viewer.ready = true;
+  viewer.generation = viewer.imageGeneration = 19;
+  viewer.selectedId = viewer.wanted;
+  viewer.live = true;
+  viewer.image = { w: 960, h: 448, release() {} };
+  app.live.phase = 'live';
+  app.live.shown = true;
+  return { app, viewer, sent, socket, canvas: element('screen'), element, window, advance };
+}
 
 /** 造一个二进制帧：4 字节大端 generation + 假 JPEG */
 function frameBytes(generation) {
@@ -251,7 +356,7 @@ test('上下滑 = 跟手滚，跟点击互斥', () => {
   assert.ok(!kinds(back).includes('tap'));
 });
 
-test('横着拖 = 拖（放大时挪画面），松手报总位移；中途改竖着也不会串成滚动，也不算点', () => {
+test('原大小横划报告位移，中途改竖着也不串成滚动或点击', () => {
   const out = play([['down', 1, 100, 100], ['move', 1, 80, 101], ['move', 1, 40, 103],
     ['move', 1, 38, 160], ['up', 1, 30, 170]]);
   assert.deepEqual(kinds(out), ['hdrag', 'hdrag', 'hdrag', 'hrelease']);
@@ -383,4 +488,156 @@ test('网址里的口令：从 #token=… 取出来，能放进请求头才算�
   assert.equal(P.cleanToken('a b'), '');
   assert.equal(P.cleanToken(''), '');
   assert.equal(P.cleanToken(null), '');
+});
+
+test('拖动消息沿用帧像素约束，四个阶段携带实际帧 generation', () => {
+  for (const phase of ['start', 'move', 'end', 'cancel']) {
+    assert.deepEqual(P.dragMessage({ x: 9999.2, y: -4, width: 960, height: 448 }, phase, 19),
+      { type: 'drag', phase, generation: 19, x: 959, y: 0, width: 960, height: 448 });
+  }
+});
+
+test('长按满 400ms 才按下，抖动可容忍，拖动不串成滚动或点击', () => {
+  const tracker = new P.GestureTracker();
+  tracker.down(1, 100, 100, 0);
+  assert.deepEqual(tracker.move(1, 103, 104, 100), []);
+  assert.deepEqual(tracker.hold(399), []);
+  assert.deepEqual(tracker.hold(400), [{ kind: 'remote-start', x: 100, y: 100 }, { kind: 'remote-move', x: 103, y: 104 }]);
+  assert.deepEqual(tracker.hold(900), []);
+  assert.deepEqual(tracker.move(1, 200, 50, 950), [{ kind: 'remote-move', x: 200, y: 50 }]);
+  assert.deepEqual(tracker.up(1, 240, 40, 1000), [{ kind: 'remote-end', x: 240, y: 40 }]);
+  tracker.down(2, 10, 10, 2000);
+  assert.deepEqual(kinds(tracker.up(2, 10, 10, 2400)), ['remote-start', 'remote-end'], '定时器晚到也不会误报点击');
+});
+
+test('快速滑动和第二指撤销长按，长按后的第二指或系统取消释放控件', () => {
+  for (const [x, y, zoomed] of [[140, 100, false], [100, 140, false], [140, 140, true]]) {
+    const tracker = new P.GestureTracker();
+    tracker.down(1, 100, 100, 0, zoomed);
+    tracker.move(1, x, y, 100);
+    assert.equal(tracker.waitingForHold, false);
+    assert.deepEqual(tracker.hold(1000), []);
+  }
+  const tracker = new P.GestureTracker();
+  tracker.down(1, 0, 0, 0);
+  tracker.down(2, 50, 0, 100);
+  assert.deepEqual(tracker.hold(600), []);
+  tracker.up(2, 50, 0, 650);
+  assert.deepEqual(tracker.up(1, 0, 0, 700), []);
+  tracker.down(3, 0, 0, 1000, true);
+  tracker.hold(1400);
+  assert.deepEqual(kinds(tracker.down(4, 50, 0, 1500)), ['remote-cancel', 'pinch-start']);
+  tracker.reset();
+  tracker.down(5, 0, 0, 2000);
+  tracker.hold(2400);
+  assert.deepEqual(kinds(tracker.cancel(5)), ['remote-cancel']);
+  assert.deepEqual(tracker.up(5, 0, 0, 2500), []);
+  tracker.down(6, 0, 0, 3000);
+  tracker.reset();
+  assert.deepEqual(tracker.hold(3500), []);
+});
+
+test('放大后单指直接沿两轴平移，斜向和抬手末段都保留，边缘限位', () => {
+  const tracker = new P.GestureTracker();
+  tracker.down(1, 100, 100, 0, true);
+  assert.deepEqual(tracker.move(1, 100, 80, 50), [{ kind: 'pan-view', dx: 0, dy: -20 }]);
+  assert.deepEqual(tracker.move(1, 140, 60, 100), [{ kind: 'pan-view', dx: 40, dy: -20 }]);
+  assert.deepEqual(tracker.up(1, 150, 65, 150), [{ kind: 'pan-view', dx: 10, dy: 5 }]);
+  assert.deepEqual(P.panView({ scale: 2, tx: 0, ty: 0 }, 500, { w: 300, h: 140 }, -500),
+    { scale: 2, tx: 150, ty: -70 });
+  tracker.down(2, 0, 0, 1000, true);
+  assert.deepEqual(kinds(tracker.move(2, 40, 40, 1400)), ['remote-start', 'remote-move'], '先停住再动仍是控件拖动');
+});
+
+test('网页事件：长按拖动按帧像素发送，移动只保留最新点，松手不补发队列', () => {
+  const { canvas, advance, sent } = appFixture();
+  canvas.fire('pointerdown', { clientX: 85, clientY: 90 });
+  advance(399);
+  assert.deepEqual(sent, []);
+  advance(1);
+  assert.deepEqual(sent, [{ type: 'drag', phase: 'start', generation: 19, x: 240, y: 224, width: 960, height: 448 }]);
+  for (let i = 1; i <= 60; i++) canvas.fire('pointermove', { clientX: 85 + i, clientY: 90 + i });
+  assert.equal(sent.length, 1);
+  advance(40);
+  assert.deepEqual(sent.at(-1), { type: 'drag', phase: 'move', generation: 19, x: 432, y: 416, width: 960, height: 448 });
+  canvas.fire('pointermove', { clientX: 900, clientY: -100 });
+  canvas.fire('pointerup', { clientX: 900, clientY: -100 });
+  advance(100);
+  assert.deepEqual(sent.at(-1), { type: 'drag', phase: 'end', generation: 19, x: 959, y: 0, width: 960, height: 448 });
+  assert.deepEqual(sent.map((message) => message.phase), ['start', 'move', 'end']);
+});
+
+test('网页事件：放大后竖向、斜向平移不发操作，原大小横划也不选择其他网页', () => {
+  const { app, canvas, advance, sent } = appFixture();
+  app.setView({ scale: 2, tx: 0, ty: 0 });
+  canvas.fire('pointerdown');
+  canvas.fire('pointermove', { clientY: 60 });
+  canvas.fire('pointermove', { clientX: 140, clientY: 50 });
+  canvas.fire('pointerup', { clientX: 150, clientY: 40 });
+  assert.equal(app.live.view.tx, 50);
+  assert.equal(app.live.view.ty, -50);
+  assert.equal(app.live.view.scale, 2);
+  assert.deepEqual(sent, []);
+  app.resetZoom();
+  sent.length = 0;
+  canvas.fire('pointerdown');
+  canvas.fire('pointermove', { clientX: 20 });
+  canvas.fire('pointerup', { clientX: 10 });
+  advance(500);
+  assert.deepEqual(sent, []);
+});
+
+test('网页事件：第二指、失焦、旋转、后台和返回列表立即取消拖动', () => {
+  for (const reason of ['second', 'cancel', 'capture', 'blur', 'rotate', 'pause', 'back']) {
+    const { app, viewer, canvas, window, advance, sent } = appFixture();
+    canvas.fire('pointerdown');
+    advance(400);
+    if (reason === 'second') canvas.fire('pointerdown', { pointerId: 2, clientX: 200 });
+    if (reason === 'cancel') canvas.fire('pointercancel');
+    if (reason === 'capture') canvas.fire('lostpointercapture');
+    if (reason === 'blur') window.fire('blur');
+    if (reason === 'rotate') { app.live.forcedLand = true; app.applyLand(); }
+    if (reason === 'pause') app.pauseLive();
+    if (reason === 'back') { app.stopPolling(); app.leaveLive(null); }
+    canvas.fire('pointerup');
+    advance(100);
+    assert.deepEqual(sent.filter((message) => message.type === 'drag').map((message) => message.phase), ['start', 'cancel'], reason);
+    assert.ok(sent.every((message) => message.type === 'drag' || message.type === 'detail'), reason);
+    assert.equal(viewer.dragState, null);
+    if (reason === 'back') assert.equal(app.currentView(), 'list');
+  }
+});
+
+test('看屏连接：必须先实际绘出匹配帧，拖动始终绑定那一代；换代清掉待发移动', async () => {
+  const { viewer, sent, advance } = appFixture();
+  const pt = { x: 20, y: 30, width: 960, height: 448 };
+  viewer.message({ type: 'selected', id: 'AB12CD34', generation: 37 });
+  assert.equal(viewer.drag('start', pt), false);
+  viewer.binary(frameBytes(19));
+  assert.equal(viewer.drag('start', pt), false);
+  viewer.binary(frameBytes(37));
+  while (viewer.decoding) await Promise.resolve();
+  assert.equal(viewer.imageGeneration, 37);
+  assert.equal(viewer.drag('start', pt), true);
+  viewer.drag('move', { ...pt, x: 300 });
+  viewer.message({ type: 'selected', id: 'AB12CD34', generation: 40 });
+  advance(100);
+  assert.deepEqual(sent.map((message) => [message.phase, message.generation]), [['start', 37], ['cancel', 37]]);
+  assert.equal(viewer.drag('end', pt), false);
+});
+
+test('看屏连接：拥塞或断线停止拖动并关闭连接，离开时 cancel 先于关闭', async () => {
+  for (const reason of ['buffered', 'disconnect', 'stop']) {
+    const { viewer, socket, sent, advance } = appFixture();
+    const pt = { x: 20, y: 30, width: 960, height: 448 };
+    viewer.drag('start', pt);
+    viewer.drag('move', { ...pt, x: 300 });
+    if (reason === 'buffered') { socket.bufferedAmount = 65537; advance(40); }
+    if (reason === 'disconnect') { socket.readyState = 3; viewer.fail('stream_disconnected'); }
+    if (reason === 'stop') await viewer.stop();
+    advance(100);
+    assert.equal(socket.closed, true, reason);
+    assert.equal(viewer.dragState, null);
+    assert.deepEqual(sent.map((message) => message.phase), reason === 'stop' ? ['start', 'cancel'] : ['start']);
+  }
 });
